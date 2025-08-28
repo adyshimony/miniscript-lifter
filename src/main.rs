@@ -23,37 +23,85 @@ fn main() {
             std::process::exit(3);
         }
     };
-    let input = ScriptBuf::from_bytes(input_bytes);
+    let spk_or_script = ScriptBuf::from_bytes(input_bytes);
 
-    match classify_script_pubkey(input.as_bytes()) {
+    match classify_script_pubkey(spk_or_script.as_bytes()) {
         None => {
-            // Treat as redeem/witness script and test liftability
-            print_liftability(input.as_script());
+            // Treat as redeem/witness/tapscript (i.e., an executable script) and test liftability
+            print_liftability(spk_or_script.as_script());
         }
-        Some(kind) => {
-            if args.len() >= 2 {
-                let inner_hex = &args[1];
-                let inner_bytes = match hex::decode(inner_hex) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        println!("NOT_LIFTABLE: inner script invalid hex - {e}");
-                        std::process::exit(3);
-                    }
-                };
-                let inner = ScriptBuf::from_bytes(inner_bytes);
-                match verify_spk_matches_inner(input.as_bytes(), inner.as_script()) {
-                    Ok(_) => print_liftability(inner.as_script()),
-                    Err(msg) => {
-                        println!("NOT_LIFTABLE: {msg}");
-                        std::process::exit(3);
-                    }
-                }
-            } else {
-                println!("NOT_LIFTABLE: input is a scriptPubKey ({kind}); provide inner redeem/witness script hex as second argument");
+        Some(SpkKind::P2WSH) => {
+            // Needs witnessScript to check/verify
+            if args.len() < 2 {
+                println!("NOT_LIFTABLE: input is a P2WSH scriptPubKey; provide the witnessScript hex as the second argument");
                 std::process::exit(3);
             }
+            let ws_hex = &args[1];
+            let ws = match hex_to_script(ws_hex) {
+                Ok(s) => s,
+                Err(e) => {
+                    println!("NOT_LIFTABLE: witnessScript invalid hex - {e}");
+                    std::process::exit(3);
+                }
+            };
+            match verify_p2wsh_matches(&spk_or_script, &ws) {
+                Ok(_) => print_liftability(ws.as_script()),
+                Err(msg) => {
+                    println!("NOT_LIFTABLE: {msg}");
+                    std::process::exit(3);
+                }
+            }
+        }
+        Some(SpkKind::P2SH) => {
+            // Needs redeemScript to check/verify
+            if args.len() < 2 {
+                println!("NOT_LIFTABLE: input is a P2SH scriptPubKey; provide the redeemScript hex as the second argument");
+                std::process::exit(3);
+            }
+            let rs_hex = &args[1];
+            let rs = match hex_to_script(rs_hex) {
+                Ok(s) => s,
+                Err(e) => {
+                    println!("NOT_LIFTABLE: redeemScript invalid hex - {e}");
+                    std::process::exit(3);
+                }
+            };
+            match verify_p2sh_matches(&spk_or_script, &rs) {
+                Ok(_) => print_liftability(rs.as_script()),
+                Err(msg) => {
+                    println!("NOT_LIFTABLE: {msg}");
+                    std::process::exit(3);
+                }
+            }
+        }
+        Some(SpkKind::P2WPKH) => {
+            // No separate witnessScript exists
+            println!("NOT_LIFTABLE: input is a P2WPKH scriptPubKey; there is no separate witnessScript. Provide the actual script you want to analyze, not the scriptPubKey");
+            std::process::exit(3);
+        }
+        Some(SpkKind::P2TR) => {
+            // Optional: accept tapscript as second arg; verification not implemented
+            if args.len() < 2 {
+                println!("NOT_LIFTABLE: input is a P2TR (Taproot) scriptPubKey; provide the tapscript (tapleaf) hex as the second argument (SPK↔tapscript verification not implemented)");
+                std::process::exit(3);
+            }
+            let ts_hex = &args[1];
+            let ts = match hex_to_script(ts_hex) {
+                Ok(s) => s,
+                Err(e) => {
+                    println!("NOT_LIFTABLE: tapscript invalid hex - {e}");
+                    std::process::exit(3);
+                }
+            };
+            // We skip verifying the tapleaf against the SPK+control block; just check liftability.
+            print_liftability(ts.as_script());
         }
     }
+}
+
+fn hex_to_script(hex: &str) -> Result<ScriptBuf, String> {
+    let bytes = hex::decode(hex).map_err(|e| format!("invalid hex: {e}"))?;
+    Ok(ScriptBuf::from_bytes(bytes))
 }
 
 fn print_liftability(script: &Script) -> ! {
@@ -85,48 +133,61 @@ fn print_liftability(script: &Script) -> ! {
     }
 }
 
+#[derive(Clone, Copy)]
+enum SpkKind {
+    P2WPKH,
+    P2WSH,
+    P2SH,
+    P2TR,
+}
+
 /// Detect common scriptPubKey patterns from raw bytes.
-fn classify_script_pubkey(b: &[u8]) -> Option<&'static str> {
+fn classify_script_pubkey(b: &[u8]) -> Option<SpkKind> {
     // v0 P2WPKH: OP_0 0x14 <20>
     if b.len() == 22 && b[0] == 0x00 && b[1] == 0x14 {
-        return Some("P2WPKH v0");
+        return Some(SpkKind::P2WPKH);
     }
     // v0 P2WSH: OP_0 0x20 <32>
     if b.len() == 34 && b[0] == 0x00 && b[1] == 0x20 {
-        return Some("P2WSH v0");
+        return Some(SpkKind::P2WSH);
     }
     // P2SH: OP_HASH160 OP_PUSHBYTES_20 <20> OP_EQUAL
     if b.len() == 23 && b[0] == 0xa9 && b[1] == 0x14 && b[22] == 0x87 {
-        return Some("P2SH");
+        return Some(SpkKind::P2SH);
     }
     // Taproot (v1): OP_1 0x20 <32>
     if b.len() == 34 && b[0] == 0x51 && b[1] == 0x20 {
-        return Some("P2TR v1");
+        return Some(SpkKind::P2TR);
     }
     None
 }
 
-/// For P2WSH/P2SH spks, verify the provided inner script matches the hash in the spk.
-fn verify_spk_matches_inner(spk: &[u8], inner: &Script) -> Result<(), String> {
-    // P2WSH: OP_0 0x20 <32=sha256(inner)>
-    if spk.len() == 34 && spk[0] == 0x00 && spk[1] == 0x20 {
-        let expected_prog = &spk[2..34]; // &[u8]
-        let got_arr = sha256::Hash::hash(inner.as_bytes()).to_byte_array(); // [u8;32]
-        if expected_prog == got_arr.as_slice() {
-            return Ok(());
-        } else {
-            return Err("inner script does not match P2WSH witness program (expected sha256(inner))".to_string());
-        }
+/// Verify that `witness_script` matches the given P2WSH scriptPubKey.
+fn verify_p2wsh_matches(spk: &ScriptBuf, witness_script: &ScriptBuf) -> Result<(), String> {
+    let b = spk.as_bytes();
+    if b.len() != 34 || b[0] != 0x00 || b[1] != 0x20 {
+        return Err("not a P2WSH scriptPubKey".to_string());
     }
-    // P2SH: OP_HASH160 OP_PUSHBYTES_20 <20=h160(inner)> OP_EQUAL
-    if spk.len() == 23 && spk[0] == 0xa9 && spk[1] == 0x14 && spk[22] == 0x87 {
-        let expected_h160 = &spk[2..22]; // &[u8]
-        let got_arr = hash160::Hash::hash(inner.as_bytes()).to_byte_array(); // [u8;20]
-        if expected_h160 == got_arr.as_slice() {
-            return Ok(());
-        } else {
-            return Err("inner script does not match P2SH redeem hash (expected hash160(inner))".to_string());
-        }
+    let expected_prog = &b[2..34];
+    let got = sha256::Hash::hash(witness_script.as_bytes()).to_byte_array(); // [u8;32]
+    if expected_prog == got.as_slice() {
+        Ok(())
+    } else {
+        Err("witnessScript does not match P2WSH witness program (expected sha256(witnessScript))".to_string())
     }
-    Err("unsupported scriptPubKey type for inner-script verification (expected P2WSH or P2SH)".to_string())
+}
+
+/// Verify that `redeem_script` matches the given P2SH scriptPubKey.
+fn verify_p2sh_matches(spk: &ScriptBuf, redeem_script: &ScriptBuf) -> Result<(), String> {
+    let b = spk.as_bytes();
+    if !(b.len() == 23 && b[0] == 0xa9 && b[1] == 0x14 && b[22] == 0x87) {
+        return Err("not a P2SH scriptPubKey".to_string());
+    }
+    let expected_h160 = &b[2..22];
+    let got = hash160::Hash::hash(redeem_script.as_bytes()).to_byte_array(); // [u8;20]
+    if expected_h160 == got.as_slice() {
+        Ok(())
+    } else {
+        Err("redeemScript does not match P2SH redeem hash (expected hash160(redeemScript))".to_string())
+    }
 }
