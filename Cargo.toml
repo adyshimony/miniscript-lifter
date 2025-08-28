@@ -1,0 +1,8 @@
+[package]
+name = "lift"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+miniscript = "12.3.5"
+hex = "0.4"
